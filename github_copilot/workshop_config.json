@@ -1,0 +1,15 @@
+{
+  "users_csv": "../users.csv",
+  "credentials_path": "/Users/jesper/.azure/credentials",
+  "azure_environment": "rubberduck",
+  "containers": [
+    {
+      "name": "azure",
+      "image": "github_copilot:latest",
+      "dockerfile": "Dockerfile",
+      "build_context": ".",
+      "memory_mb": 2000,
+      "timeout_seconds": 1200
+    }
+  ]
+}

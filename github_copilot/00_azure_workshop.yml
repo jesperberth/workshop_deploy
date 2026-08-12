@@ -1,0 +1,155 @@
+---
+- name: Copilot Workshop
+  hosts: localhost
+  connection: local
+  vars:
+    location: switzerlandnorth
+    resource_group: "workshop-{{ adminUser }}"
+    virtualnetwork: workshopNetwork
+    subnet: Servers
+
+  tasks:
+    - name: Create resource group
+      azure.azcollection.azure_rm_resourcegroup:
+        name: "{{ resource_group }}"
+        location: "{{ location }}"
+
+    - name: Create a virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ resource_group }}"
+        name: "{{ virtualnetwork }}"
+        address_prefixes_cidr: "10.1.0.0/16"
+
+    - name: Create a subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        virtual_network_name: "{{ virtualnetwork }}"
+        name: "{{ subnet }}"
+        address_prefix_cidr: "10.1.0.0/24"
+
+    - name: Create Security Group for webserver
+      azure.azcollection.azure_rm_securitygroup:
+        resource_group: "{{ resource_group }}"
+        name: SG_Network
+        purge_rules: true
+        rules:
+          - name: Allow_SSH
+            protocol: Tcp
+            destination_port_range: 22
+            access: Allow
+            priority: 100
+            direction: Inbound
+          - name: Allow_RDP
+            protocol: Tcp
+            destination_port_range: 3389
+            access: Allow
+            priority: 101
+            direction: Inbound
+          - name: Allow_HTTP
+            protocol: Tcp
+            destination_port_range: 80
+            access: Allow
+            priority: 102
+            direction: Inbound
+          - name: Allow_HTTPS
+            protocol: Tcp
+            destination_port_range: 443
+            access: Allow
+            priority: 103
+            direction: Inbound
+
+    - name: Create Standard static public IP addresses
+      azure.azcollection.azure_rm_publicipaddress:
+        resource_group: "{{ resource_group }}"
+        name: "{{ item.name }}_public_ip"
+        allocation_method: Static
+        sku: Standard
+        version: ipv4
+        state: present
+      loop:
+        - {name: 'devbox'}
+        - {name: 'gpunode'}
+      async: 1000
+      poll: 0
+      register: create_public_ip
+
+    - name: Wait for Public IP addresses
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 30
+      delay: 5
+      with_items: "{{ create_public_ip.results }}"
+
+    - name: Create network interfaces
+      azure.azcollection.azure_rm_networkinterface:
+        name: "{{ item.name }}_nic01"
+        resource_group: "{{ resource_group }}"
+        virtual_network: "{{ virtualnetwork }}"
+        subnet_name: "{{ subnet }}"
+        security_group: "SG_Network"
+        enable_ip_forwarding: "{{ item.forward | default(false) }}"
+        ip_configurations:
+          - name: "{{ item.name }}_nic01_ipconfig"
+            public_ip_address_name: "{{ item.name }}_public_ip"
+            primary: true
+            private_ip_allocation_method: Static
+            private_ip_address: "{{ item.ip }}"
+      loop:
+        - {name: 'devbox', ip: '10.1.0.5'}
+        - {name: 'gpunode', ip: '10.1.0.6'}
+      async: 1000
+      poll: 0
+      register: create_nic
+
+    - name: Wait for Network Interfaces
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 30
+      delay: 5
+      with_items: "{{ create_nic.results }}"
+
+  # Create Virtual Machines
+    - name: Create Virtual Machines
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ item.name }}"
+        os_type: "{{ item.os }}"
+        admin_username: "{{ adminUser }}"
+        admin_password: "{{ adminPassword }}"
+        managed_disk_type: Premium_LRS
+        state: present
+        image:
+          offer: "{{ item.offer }}"
+          publisher: "{{ item.pub }}"
+          sku: "{{ item.sku }}"
+          version: latest
+        vm_size: "{{ item.size }}"
+        network_interfaces: "{{ item.name }}_nic01"
+        security_profile:
+          security_type: "{{ item.security_type | default('TrustedLaunch') }}"
+          uefi_settings:
+            secure_boot_enabled: "{{ item.secboot | default(true) }}"
+            v_tpm_enabled: true
+        tags:
+          owner: "{{ adminUser }}"
+          ansible: "{{ adminUser }}"
+          type: "{{ item.name  }}_{{ adminUser }}"
+      loop:
+        - {name: 'gpunode', size: 'Standard_NC24ads_A100_v4', os: 'Linux', offer: 'ubuntu-24_04-lts', pub: 'canonical', sku: 'server', secboot: false, security_type: 'TrustedLaunch' }
+        - {name: 'devbox', size: 'Standard_D4ads_v6', os: 'Windows', offer: 'windows-11', pub: 'microsoftwindowsdesktop', sku: 'win11-25h2-pro', security_type: 'TrustedLaunch'}
+      async: 1000
+      poll: 0
+      register: create_vm
+
+    - name: Wait for Virtual Machines
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 100
+      delay: 10
+      with_items: "{{ create_vm.results }}"
