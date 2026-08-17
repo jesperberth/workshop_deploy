@@ -121,6 +121,7 @@
         admin_username: "{{ adminUser }}"
         admin_password: "{{ adminPassword }}"
         managed_disk_type: Premium_LRS
+        os_disk_size_gb: "{{ 1024 if item.name == 'gpunode' else omit }}"
         state: present
         image:
           offer: "{{ item.offer }}"
