@@ -1,6 +1,6 @@
 ---
-- name: Automation Class Student
-  hosts: "{{ student | default([]) }}"
+- name: Devbox
+  hosts: "{{ devbox | default([]) }}"
   gather_facts: true
   vars:
     ansible_connection: ssh
@@ -41,11 +41,12 @@
         data: 1
         type: dword
 
-    - name: Install vscode and git
+    - name: Install vscode, git and nodejs
       chocolatey.chocolatey.win_chocolatey:
         name:
           - vscode
           - git
+          - nodejs.install
         state: present
 
     - name: Test if Microsoft-Windows-Subsystem-Linux exist

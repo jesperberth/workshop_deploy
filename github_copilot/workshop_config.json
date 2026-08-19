@@ -10,6 +10,22 @@
       "build_context": ".",
       "memory_mb": 2000,
       "timeout_seconds": 1200
+    },
+    {
+      "name": "devbox",
+      "image": "github_copilot_devbox:latest",
+      "dockerfile": "Dockerfile_Devbox",
+      "build_context": ".",
+      "memory_mb": 300,
+      "timeout_seconds": 1200
+    },
+        {
+      "name": "gpunode",
+      "image": "github_copilot_gpunode:latest",
+      "dockerfile": "Dockerfile_GpuNode",
+      "build_context": ".",
+      "memory_mb": 300,
+      "timeout_seconds": 1200
     }
   ]
 }

@@ -1,0 +1,22 @@
+---
+- name: Gpunode
+  hosts: "{{ gpunode | default([]) }}"
+  gather_facts: true
+  vars:
+    ansible_host_key_checking: false
+
+  tasks:
+    - name: Update all packages to their latest version
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
+      become: true
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - btop
+          - nvidia-driver-595-open
+          - docker.io
+        state: present
+      become: true
