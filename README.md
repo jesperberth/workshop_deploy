@@ -50,6 +50,8 @@ Example (`github_copilot/workshop_config.json`):
   "users_csv": "../users.csv",
   "credentials_path": "/Users/jesper/.azure/credentials",
   "azure_environment": "AzureCloud",
+  "memory_reserve_percent": 10,
+  "memory_reserve_min_mb": 512,
   "containers": [
     {
       "name": "instructor",
@@ -73,6 +75,12 @@ Notes:
 - `azure_environment` is injected into containers as `AZURE_ENVIRONMENT` and `ARM_ENVIRONMENT`.
 - If a container has `dockerfile`, the script builds the image before deployment.
 - `build_context` is optional and defaults to `.`.
+- `memory_mb` is a scheduling reservation, not a Docker hard memory limit.
+- The scheduler keeps the larger of `memory_reserve_percent` or `memory_reserve_min_mb` free. The defaults are 10 percent and 512 MB.
+- Container list order defines each user's required stage order. The first stage is prioritized across users.
+- When a container finishes, Docker VM memory is measured again and newly available capacity is filled immediately.
+- If the next first-stage job does not fit, a ready later-stage job may use the remaining memory.
+- A failed or timed-out stage prevents later stages from running for that user. Containers are removed after completion.
 
 ## Run Deployment
 

@@ -16,6 +16,7 @@ COPY 01_devbox_config.yml ./
 COPY class.azure_rm.yml ./
 COPY wsl_create_user.sh ./
 COPY wsl_install_docker.sh ./
+COPY wsl_install_gh.sh ./
 
 ARG AZURE_PROFILE=AzureCloud
 ENV AZURE_PROFILE=${AZURE_PROFILE}

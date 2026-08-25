@@ -20,3 +20,61 @@
           - docker.io
         state: present
       become: true
+
+    - name: Reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      become: true
+
+    - name: Add current user to the docker group
+      ansible.builtin.user:
+        name: "{{ ansible_facts.env.USER }}"
+        groups: docker
+        append: true
+      become: true
+
+    - name: Allow current user to run dockerd without a password
+      ansible.builtin.copy:
+        content: "{{ ansible_facts.env.USER }} ALL=(ALL) NOPASSWD: /usr/bin/dockerd\n"
+        dest: /etc/sudoers.d/dockerd-nopasswd
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+      become: true
+
+    - name: Enable and start the Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      become: true
+
+    - name: Add NVIDIA repository (deb822)
+      ansible.builtin.deb822_repository:
+        name: nvidia-container-toolkit
+        types: deb
+        uris: https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH)
+        suites: /
+        signed_by: https://nvidia.github.io/libnvidia-container/gpgkey
+        state: present
+      become: true
+
+    - name: Install NVIDIA container toolkit
+      ansible.builtin.apt:
+        name: nvidia-container-toolkit
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Configure Docker runtime for NVIDIA Container Toolkit
+      ansible.builtin.command:
+        cmd: nvidia-ctk runtime configure --runtime=docker
+      become: true
+      notify: Restart docker service
+
+# Place this in your playbook's 'handlers' section
+  handlers:
+    - name: Restart docker service
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+      become: true

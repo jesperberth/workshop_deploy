@@ -11,6 +11,13 @@
     ansible_become_password: "{{ ansible_password }}"
     ansible_become_flags: logon_type=new_credentials logon_flags=netcredentials_only
     ubuntuinstalled: false
+    font_zip: 'C:\Users\{{ ansible_user }}\Downloads\ubuntu-font-family-0.83.zip'
+    font_tmp: 'C:\Windows\Temp\ubuntu-fonts'
+    font_names:
+      UbuntuMono-R.ttf: Ubuntu Mono (TrueType)
+      UbuntuMono-RI.ttf: Ubuntu Mono Italic (TrueType)
+      UbuntuMono-B.ttf: Ubuntu Mono Bold (TrueType)
+      UbuntuMono-BI.ttf: Ubuntu Mono Bold Italic (TrueType)
 
   tasks:
     - name: RegKey HideFirstRunExperience
@@ -46,7 +53,6 @@
         name:
           - vscode
           - git
-          - nodejs.install
         state: present
 
     - name: Test if Microsoft-Windows-Subsystem-Linux exist
@@ -116,6 +122,49 @@
           - /norestart
       when: not wslpath.stat.exists
 
+    - name: Downlaod UbuntuMono font archive
+      ansible.windows.win_get_url:
+        url: https://assets.ubuntu.com/v1/0cef8205-ubuntu-font-family-0.83.zip
+        dest: '{{ font_zip }}'
+        force: false
+
+    - name: Extract font archive
+      community.windows.win_unzip:
+        src: '{{ font_zip }}'
+        dest: '{{ font_tmp }}'
+        creates: '{{ font_tmp }}'
+
+    - name: Find UbuntuMono font files
+      ansible.windows.win_find:
+        paths: '{{ font_tmp }}'
+        recurse: true
+        patterns: 'UbuntuMono*.ttf'
+      register: mono_fonts
+
+    - name: Copy fonts into the Windows font directory
+      ansible.windows.win_copy:
+        src: '{{ item.path }}'
+        dest: 'C:\Windows\Fonts\{{ item.filename }}'
+        remote_src: true
+      loop: '{{ mono_fonts.files }}'
+      loop_control:
+        label: '{{ item.filename }}'
+
+    - name: Register fonts with Windows
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts
+        name: '{{ font_names[item.filename] }}'
+        data: '{{ item.filename }}'
+        type: string
+      loop: '{{ mono_fonts.files }}'
+      loop_control:
+        label: '{{ item.filename }}'
+
+    - name: Clean up extracted files
+      ansible.windows.win_file:
+        path: '{{ font_tmp }}'
+        state: absent
+
     - name: Reboot
       ansible.windows.win_reboot:
         post_reboot_delay: 120
@@ -155,3 +204,11 @@
 
     - name: Install docker in WSL
       ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user root -- /bin/bash wsl_install_docker.sh {{ ansible_user }}"
+
+    - name: Copy wsl_install_gh.sh
+      ansible.windows.win_copy:
+        src: wsl_install_gh.sh
+        dest: "C:\\Users\\{{ ansible_user }}\\wsl_install_gh.sh"
+
+    - name: Install GH CLI in WSL
+      ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user root -- /bin/bash wsl_install_gh.sh {{ ansible_user }}"

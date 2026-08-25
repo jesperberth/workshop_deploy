@@ -3,15 +3,17 @@ import csv
 import json
 import subprocess
 import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+import re
 import sys
 import time
 
 MEM_CONTAINER1_MB = 2000  # ansiblenewclass:latest
 MEM_CONTAINER2_MB = 300   # ansiblenewclassstudent:latest
 DEFAULT_CONFIG_FILE = 'workshop_config.json'
+DEFAULT_MEMORY_RESERVE_PERCENT = 10
+DEFAULT_MEMORY_RESERVE_MIN_MB = 512
 
 
 def load_project_config(project_dir: Path) -> dict:
@@ -22,6 +24,8 @@ def load_project_config(project_dir: Path) -> dict:
         'users_csv': 'users.csv',
         'credentials_path': '/Users/jesper/.azure/credentials',
         'azure_environment': 'AzureCloud',
+        'memory_reserve_percent': DEFAULT_MEMORY_RESERVE_PERCENT,
+        'memory_reserve_min_mb': DEFAULT_MEMORY_RESERVE_MIN_MB,
         'containers': [
             {
                 'name': 'instructor',
@@ -67,6 +71,15 @@ def load_project_config(project_dir: Path) -> dict:
         config.setdefault('users_csv', default_config['users_csv'])
         config.setdefault('credentials_path', default_config['credentials_path'])
         config.setdefault('azure_environment', default_config['azure_environment'])
+        config.setdefault('memory_reserve_percent', DEFAULT_MEMORY_RESERVE_PERCENT)
+        config.setdefault('memory_reserve_min_mb', DEFAULT_MEMORY_RESERVE_MIN_MB)
+
+        reserve_percent = int(config['memory_reserve_percent'])
+        reserve_min_mb = int(config['memory_reserve_min_mb'])
+        if not 0 <= reserve_percent < 100:
+            raise ValueError("memory_reserve_percent must be between 0 and 99")
+        if reserve_min_mb < 0:
+            raise ValueError("memory_reserve_min_mb cannot be negative")
         return config
 
     except (json.JSONDecodeError, OSError, ValueError) as e:
@@ -86,37 +99,52 @@ def resolve_path(path_value: str, project_dir: Path) -> Path:
 
     return (Path.cwd() / candidate).resolve()
 
-def detect_vm_memory() -> int:
-    """Detect total VM memory available to Docker, returns MB"""
+def detect_docker_total_memory() -> int:
+    """Return the Docker VM's total memory in MB."""
     result = subprocess.run(
         ['docker', 'info', '--format', '{{json .MemTotal}}'],
         capture_output=True, text=True, check=False
     )
     if result.returncode == 0:
         try:
-            return int(result.stdout.strip()) // (1024 * 1024)
+            total_mb = int(result.stdout.strip()) // (1024 * 1024)
+            if total_mb > 0:
+                return total_mb
         except ValueError:
             pass
-    logging.warning("Could not detect VM memory, defaulting to 4096 MB")
-    return 4096
+    raise RuntimeError(f"Could not detect Docker total memory: {result.stderr.strip()}")
 
 
-def calculate_semaphore_limits(available_mb: int, containers: list[dict]) -> dict[str, int]:
-    """Calculate max concurrent runs per container type based on available memory."""
-    limits: dict[str, int] = {}
-
-    for container in containers:
-        name = container['name']
-        memory_mb = int(container.get('memory_mb', 512))
-        if memory_mb <= 0:
-            memory_mb = 512
-        limits[name] = max(1, available_mb // memory_mb)
-
-    limits_message = ', '.join(
-        f"{name}={count}" for name, count in limits.items()
+def detect_docker_available_memory(probe_image: str) -> int:
+    """Return the Docker VM's current MemAvailable value in MB."""
+    result = subprocess.run(
+        [
+            'docker', 'run', '--rm', '--entrypoint', 'cat',
+            probe_image, '/proc/meminfo'
+        ],
+        capture_output=True, text=True, check=False
     )
-    logging.info("VM memory: %s MB -> max concurrent per container type: %s", available_mb, limits_message)
-    return limits
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith('MemAvailable:'):
+                try:
+                    available_kb = int(line.split()[1])
+                    if available_kb > 0:
+                        return available_kb // 1024
+                except (IndexError, ValueError):
+                    break
+    raise RuntimeError(f"Could not detect Docker available memory: {result.stderr.strip()}")
+
+
+def container_memory_mb(container: dict) -> int:
+    """Return a validated scheduling reservation for a container."""
+    memory_mb = int(container.get('memory_mb', 512))
+    return memory_mb if memory_mb > 0 else 512
+
+
+def calculate_memory_reserve(total_mb: int, percent: int, minimum_mb: int) -> int:
+    """Calculate memory kept free for Docker and its Linux VM."""
+    return max(minimum_mb, total_mb * percent // 100)
 
 
 def setup_logging(log_to_file: bool = False, verbose: bool = False) -> None:
@@ -241,74 +269,203 @@ def wait_for_container(container_id: str, timeout: int = 1200, container_label: 
         logging.error(f"Error monitoring container {container_id}: {str(e)}")
         return False
 
-def launch_container(username: str, password: str, containers: list[dict],
-                     semaphores: dict[str, threading.Semaphore], credentials_path: Path,
-                     azure_environment: str) -> bool:
-    """
-    Launch workshop containers sequentially with provided credentials.
-    Semaphores gate each container type to enforce memory limits independently.
-    Returns True if all containers succeed, False otherwise.
-    """
+
+def save_container_logs(container_id: str, username: str, container_name: str,
+                        log_dir: Path = Path('failed_container_logs')) -> Path | None:
+    """Save combined Docker output for a failed container before cleanup."""
+    safe_username = re.sub(r'[^A-Za-z0-9_.-]+', '_', username)
+    safe_container_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', container_name)
+    log_path = log_dir / f'{safe_username}_{safe_container_name}_{container_id[:12]}.log'
+
     try:
-        # Validate inputs
+        logs_result = subprocess.run(
+            ['docker', 'logs', '--timestamps', container_id],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False
+        )
+        if logs_result.returncode != 0:
+            logging.warning(
+                "Could not read logs for container %s: %s",
+                container_id, logs_result.stdout.strip()
+            )
+            return None
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(logs_result.stdout, encoding='utf-8')
+        logging.error("Saved failed container logs to %s", log_path.resolve())
+        return log_path
+    except (OSError, subprocess.SubprocessError) as error:
+        logging.warning("Could not save logs for container %s: %s", container_id, error)
+        return None
+
+def run_container_job(username: str, password: str, container: dict,
+                      credentials_path: Path, azure_environment: str) -> bool:
+    """Launch, monitor, and clean up one workshop container."""
+    container_id = ''
+    try:
         if not username or not password:
             raise ValueError("Username and password cannot be empty")
 
         if not credentials_path.exists():
             raise FileNotFoundError(f"Credentials file not found at {credentials_path}")
 
-        for container in containers:
-            name = container['name']
-            image = container['image']
-            timeout = int(container.get('timeout_seconds', 1200))
+        name = container['name']
+        image = container['image']
+        timeout = int(container.get('timeout_seconds', 1200))
+        result = subprocess.run(
+            [
+                'docker', 'run', '-d',
+                '--mount', f'type=bind,source={credentials_path},target=/root/.azure/credentials',
+                '-e', f'username={username}',
+                '-e', f'password={password}',
+                '-e', f'AZURE_ENVIRONMENT={azure_environment}',
+                '-e', f'ARM_ENVIRONMENT={azure_environment}',
+                image
+            ],
+            text=True, capture_output=True, check=False
+        )
+        if result.returncode != 0:
+            logging.error(
+                "Container '%s' launch failed for user %s. Error: %s",
+                name, username, result.stderr
+            )
+            return False
 
-            with semaphores[name]:
-                logging.info(
-                    "Starting container '%s' for user %s using image %s",
-                    name,
-                    username,
-                    image
-                )
-
-                result = subprocess.run(
-                    [
-                        'docker', 'run', '-d',
-                        '--mount', f'type=bind,source={credentials_path},target=/root/.azure/credentials',
-                        '-e', f'username={username}',
-                        '-e', f'password={password}',
-                        '-e', f'AZURE_ENVIRONMENT={azure_environment}',
-                        '-e', f'ARM_ENVIRONMENT={azure_environment}',
-                        image
-                    ],
-                    text=True, capture_output=True, check=False
-                )
-
-                if result.returncode != 0:
-                    logging.error(
-                        "Container '%s' launch failed for user %s. Error: %s",
-                        name, username, result.stderr
-                    )
-                    return False
-
-                container_id = result.stdout.strip()
-                logging.info(
-                    "Launched container '%s' for user %s. Container ID: %s",
-                    name, username, container_id
-                )
-
-                if not wait_for_container(
-                    container_id,
-                    timeout=timeout,
-                    container_label=f"{username}:{name}"
-                ):
-                    logging.error("Container '%s' failed or timed out for user %s", name, username)
-                    return False
-
-        return True
+        container_id = result.stdout.strip()
+        logging.info(
+            "Launched container '%s' for user %s. Container ID: %s",
+            name, username, container_id
+        )
+        success = wait_for_container(
+            container_id,
+            timeout=timeout,
+            container_label=f"{username}:{name}"
+        )
+        if not success:
+            logging.error("Container '%s' failed or timed out for user %s", name, username)
+            save_container_logs(container_id, username, name)
+        return success
 
     except (subprocess.SubprocessError, ValueError, FileNotFoundError) as e:
-        logging.error(f"Error launching containers for user {username}: {str(e)}")
+        logging.error("Error running container for user %s: %s", username, str(e))
         return False
+    finally:
+        if container_id:
+            cleanup_result = subprocess.run(
+                ['docker', 'rm', '-f', container_id],
+                text=True, capture_output=True, check=False
+            )
+            if cleanup_result.returncode != 0:
+                logging.warning(
+                    "Could not remove container %s: %s",
+                    container_id, cleanup_result.stderr.strip()
+                )
+
+
+def select_ready_jobs(ready_jobs: list[dict], headroom_mb: int) -> tuple[list[dict], int]:
+    """Select jobs by stage and CSV order while their reservations fit."""
+    selected: list[dict] = []
+    remaining_mb = headroom_mb
+    for job in sorted(ready_jobs, key=lambda item: (item['stage'], item['order'])):
+        memory_mb = container_memory_mb(job['container'])
+        if memory_mb <= remaining_mb:
+            selected.append(job)
+            remaining_mb -= memory_mb
+    return selected, remaining_mb
+
+
+def schedule_container_jobs(rows: list[dict], containers: list[dict],
+                            credentials_path: Path, azure_environment: str,
+                            total_memory_mb: int, reserve_mb: int,
+                            available_memory_probe, job_runner=run_container_job) -> tuple[int, int]:
+    """Run per-user container stages with dynamic, memory-aware scheduling."""
+    usable_capacity_mb = total_memory_mb - reserve_mb
+    if usable_capacity_mb < max(container_memory_mb(container) for container in containers):
+        raise RuntimeError("Usable Docker memory cannot fit the largest configured container")
+
+    ready_jobs = [
+        {
+            'username': row['Username'],
+            'password': row['Password'],
+            'stage': 0,
+            'order': order,
+            'container': containers[0]
+        }
+        for order, row in enumerate(rows)
+    ]
+    active_jobs = {}
+    active_reserved_mb = 0
+    completed_users: set[str] = set()
+    failed_users: set[str] = set()
+    last_available_mb = available_memory_probe()
+
+    with ThreadPoolExecutor(max_workers=len(rows)) as executor:
+        while ready_jobs or active_jobs:
+            reservation_headroom = usable_capacity_mb - active_reserved_mb
+            live_headroom = max(0, last_available_mb - reserve_mb)
+            selected_jobs, _ = select_ready_jobs(
+                ready_jobs, min(reservation_headroom, live_headroom)
+            )
+
+            for job in selected_jobs:
+                ready_jobs.remove(job)
+                memory_mb = container_memory_mb(job['container'])
+                active_reserved_mb += memory_mb
+                logging.info(
+                    "Scheduling stage %s '%s' for %s: estimate=%s MB, "
+                    "available=%s MB, active reservations=%s MB",
+                    job['stage'] + 1, job['container']['name'], job['username'],
+                    memory_mb, last_available_mb, active_reserved_mb
+                )
+                future = executor.submit(
+                    job_runner,
+                    job['username'], job['password'], job['container'],
+                    credentials_path, azure_environment
+                )
+                active_jobs[future] = job
+
+            if not active_jobs:
+                raise RuntimeError(
+                    "No ready container fits current Docker memory availability "
+                    f"({last_available_mb} MB available, {reserve_mb} MB reserved)"
+                )
+
+            completed_futures, _ = wait(active_jobs, return_when=FIRST_COMPLETED)
+            for future in completed_futures:
+                job = active_jobs.pop(future)
+                active_reserved_mb -= container_memory_mb(job['container'])
+                try:
+                    succeeded = bool(future.result())
+                except Exception:
+                    logging.exception(
+                        "Container '%s' raised an unexpected error for user %s",
+                        job['container']['name'], job['username']
+                    )
+                    succeeded = False
+
+                next_stage = job['stage'] + 1
+                if succeeded and next_stage < len(containers):
+                    ready_jobs.append({
+                        **job,
+                        'stage': next_stage,
+                        'container': containers[next_stage]
+                    })
+                elif succeeded:
+                    completed_users.add(job['username'])
+                else:
+                    failed_users.add(job['username'])
+
+            try:
+                last_available_mb = available_memory_probe()
+            except RuntimeError as error:
+                logging.warning(
+                    "Memory probe failed after completion; retaining last reading of %s MB: %s",
+                    last_available_mb, error
+                )
+
+    return len(completed_users), len(failed_users)
 
 def read_csv(filepath: Path, config: dict, project_dir: Path) -> None:
     """Read user credentials from CSV and launch containers in parallel."""
@@ -338,34 +495,26 @@ def read_csv(filepath: Path, config: dict, project_dir: Path) -> None:
         azure_environment = str(config.get('azure_environment', 'AzureCloud'))
         logging.info("Using Azure environment: %s", azure_environment)
 
-        available_mb = detect_vm_memory()
-        semaphore_limits = calculate_semaphore_limits(available_mb, containers)
-        semaphores = {
-            name: threading.Semaphore(limit)
-            for name, limit in semaphore_limits.items()
-        }
-
-        successful_launches = 0
-        failed_launches = 0
-
-        with ThreadPoolExecutor(max_workers=len(rows)) as executor:
-            futures = {
-                executor.submit(
-                    launch_container,
-                    row['Username'],
-                    row['Password'],
-                    containers,
-                    semaphores,
-                    credentials_path,
-                    azure_environment
-                ): row['Username']
-                for row in rows
-            }
-            for future in as_completed(futures):
-                if future.result():
-                    successful_launches += 1
-                else:
-                    failed_launches += 1
+        total_memory_mb = detect_docker_total_memory()
+        reserve_mb = calculate_memory_reserve(
+            total_memory_mb,
+            int(config['memory_reserve_percent']),
+            int(config['memory_reserve_min_mb'])
+        )
+        logging.info(
+            "Docker memory: total=%s MB, reserve=%s MB, scheduler capacity=%s MB",
+            total_memory_mb, reserve_mb, total_memory_mb - reserve_mb
+        )
+        probe_image = containers[0]['image']
+        successful_launches, failed_launches = schedule_container_jobs(
+            rows,
+            containers,
+            credentials_path,
+            azure_environment,
+            total_memory_mb,
+            reserve_mb,
+            lambda: detect_docker_available_memory(probe_image)
+        )
 
         logging.info(f"Deployment complete. Successful: {successful_launches}, Failed: {failed_launches}")
 
