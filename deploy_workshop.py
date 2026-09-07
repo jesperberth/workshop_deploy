@@ -4,6 +4,7 @@ import json
 import subprocess
 import logging
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import deque
 from pathlib import Path
 import re
 import sys
@@ -160,7 +161,12 @@ def setup_logging(log_to_file: bool = False, verbose: bool = False) -> None:
     )
 
 
-def build_container_images(containers: list[dict], project_dir: Path, azure_environment: str) -> None:
+def build_container_images(
+    containers: list[dict],
+    project_dir: Path,
+    azure_environment: str,
+    timeout: int = 3600
+) -> None:
     """Build container images for config entries that define dockerfile."""
     for container in containers:
         dockerfile = container.get('dockerfile')
@@ -188,28 +194,60 @@ def build_container_images(containers: list[dict], project_dir: Path, azure_envi
             build_context_path
         )
 
-        build_result = subprocess.run(
-            [
-                'docker', 'build',
-                '-f', str(dockerfile_path),
-                '--build-arg', f'AZURE_PROFILE={azure_environment}',
-                '-t', image,
-                str(build_context_path)
-            ],
+        build_command = [
+            'docker', 'build',
+            '--progress', 'plain',
+            '-f', str(dockerfile_path),
+            '--build-arg', f'AZURE_PROFILE={azure_environment}',
+            '-t', image,
+            str(build_context_path)
+        ]
+
+        # Stream the build output so long builds show progress instead of appearing stuck.
+        process = subprocess.Popen(
+            build_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            capture_output=True,
-            check=False
+            bufsize=1
         )
 
-        if build_result.returncode != 0:
+        output_tail: deque[str] = deque(maxlen=50)
+        start_time = time.time()
+        try:
+            for line in process.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                output_tail.append(line)
+                logging.info("[build %s] %s", image, line)
+
+                if timeout and time.time() - start_time > timeout:
+                    process.kill()
+                    process.wait()
+                    raise RuntimeError(
+                        f"Image build for {image} exceeded timeout of {timeout} seconds"
+                    )
+            returncode = process.wait()
+        except KeyboardInterrupt:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            if process.stdout:
+                process.stdout.close()
+
+        if returncode != 0:
             logging.error(
-                "Failed building image %s. Docker output: %s",
+                "Failed building image %s. Docker output:\n%s",
                 image,
-                build_result.stderr
+                "\n".join(output_tail)
             )
             raise RuntimeError(f"Image build failed for {image}")
 
-        logging.info("Image build complete: %s", image)
+        logging.info(
+            "Image build complete: %s (%ss)", image, int(time.time() - start_time)
+        )
 
 def wait_for_container(container_id: str, timeout: int = 1200, container_label: str = '') -> bool:
     """
@@ -527,6 +565,12 @@ def main():
     parser.add_argument('project_folder', help='Project folder that contains workshop_config.json')
     parser.add_argument('--log', action='store_true', help='Enable logging to stdout and file')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose debug output')
+    parser.add_argument(
+        '--build-timeout',
+        type=int,
+        default=3600,
+        help='Maximum seconds allowed per container image build (default: 3600)'
+    )
     args = parser.parse_args()
 
     setup_logging(log_to_file=args.log, verbose=args.verbose)
@@ -541,7 +585,9 @@ def main():
     azure_environment = str(config.get('azure_environment', 'AzureCloud'))
 
     logging.info("Starting deployment for project folder: %s", project_dir)
-    build_container_images(config['containers'], project_dir, azure_environment)
+    build_container_images(
+        config['containers'], project_dir, azure_environment, timeout=args.build_timeout
+    )
     read_csv(csv_path, config, project_dir)
 
 if __name__ == "__main__":

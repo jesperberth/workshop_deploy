@@ -18,6 +18,7 @@
           - btop
           - nvidia-driver-595-open
           - docker.io
+          - python3-pip
         state: present
       become: true
 
@@ -70,6 +71,28 @@
         cmd: nvidia-ctk runtime configure --runtime=docker
       become: true
       notify: Restart docker service
+
+    - name: Install Huggingface CLI
+      ansible.builtin.command:
+        cmd: curl -LsSf https://hf.co/cli/install.sh | bash
+
+    - name: Download Model from Huggingface
+      ansible.builtin.command:
+        cmd: hf download Qwen/Qwen3.8-27B-FP8
+
+    - name: Create directory for Huggingface cache
+      ansible.builtin.file:
+        name: /home/{{ ansible_facts.env.USER }}/custom-vllm:26.07
+        state: directory
+        mode: '0755'
+
+    - name: Create Dockerfile for custom vLLM image
+      ansible.builtin.copy:
+        dest: /home/{{ ansible_facts.env.USER }}/custom-vllm:26.07/Dockerfile
+        content: |
+          FROM nvcr.io/nvidia/vllm:26.07-py3
+
+          RUN pip install -q -U xgrammar && pip install -q transformers==5.6.1
 
 # Place this in your playbook's 'handlers' section
   handlers:

@@ -212,3 +212,11 @@
 
     - name: Install GH CLI in WSL
       ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user root -- /bin/bash wsl_install_gh.sh {{ ansible_user }}"
+
+    - name: Copy wsl_install_node.sh
+      ansible.windows.win_copy:
+        src: wsl_install_node.sh
+        dest: "C:\\Users\\{{ ansible_user }}\\wsl_install_node.sh"
+
+    - name: Install NodeJS in WSL
+      ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user root -- /bin/bash wsl_install_node.sh {{ ansible_user }}"
