@@ -17,6 +17,8 @@ COPY class.azure_rm.yml ./
 COPY wsl_create_user.sh ./
 COPY wsl_install_docker.sh ./
 COPY wsl_install_gh.sh ./
+COPY wsl_install_node.sh ./
+COPY wsl_setup_ssh.sh ./
 
 ARG AZURE_PROFILE=AzureCloud
 ENV AZURE_PROFILE=${AZURE_PROFILE}

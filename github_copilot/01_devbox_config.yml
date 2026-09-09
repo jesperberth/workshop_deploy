@@ -219,4 +219,12 @@
         dest: "C:\\Users\\{{ ansible_user }}\\wsl_install_node.sh"
 
     - name: Install NodeJS in WSL
-      ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user root -- /bin/bash wsl_install_node.sh {{ ansible_user }}"
+      ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user {{ ansible_user }} -- /bin/bash wsl_install_node.sh"
+
+    - name: Copy wsl_setup_ssh.sh
+      ansible.windows.win_copy:
+        src: wsl_setup_ssh.sh
+        dest: "C:\\Users\\{{ ansible_user }}\\wsl_setup_ssh.sh"
+
+    - name: Setup SSH in WSL
+      ansible.windows.win_shell: "wsl.exe -d Ubuntu-24.04 --user {{ ansible_user }} -- /bin/bash wsl_setup_ssh.sh {{ ansible_user }} {{ ansible_password }}"

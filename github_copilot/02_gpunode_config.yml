@@ -19,13 +19,16 @@
           - nvidia-driver-595-open
           - docker.io
           - python3-pip
+          - python3-venv
         state: present
       become: true
+      register: install_packages_result
 
     - name: Reboot
       ansible.builtin.reboot:
         reboot_timeout: 600
       become: true
+      when: install_packages_result.changed
 
     - name: Add current user to the docker group
       ansible.builtin.user:
@@ -70,34 +73,87 @@
       ansible.builtin.command:
         cmd: nvidia-ctk runtime configure --runtime=docker
       become: true
-      notify: Restart docker service
+      register: nvidia_ctk_result
+
+    - name: Restart Docker service
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      become: true 
+      when: nvidia_ctk_result.changed
 
     - name: Install Huggingface CLI
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: curl -LsSf https://hf.co/cli/install.sh | bash
+        executable: /bin/bash
 
     - name: Download Model from Huggingface
-      ansible.builtin.command:
-        cmd: hf download Qwen/Qwen3.8-27B-FP8
+      ansible.builtin.shell:
+        cmd: /home/{{ ansible_facts.env.USER }}/.local/bin/hf download Qwen/Qwen3.8-27B-FP8
+        executable: /bin/bash
 
     - name: Create directory for Huggingface cache
       ansible.builtin.file:
-        name: /home/{{ ansible_facts.env.USER }}/custom-vllm:26.07
+        name: /home/{{ ansible_facts.env.USER }}/custom-vllm-26.07
         state: directory
         mode: '0755'
 
     - name: Create Dockerfile for custom vLLM image
       ansible.builtin.copy:
-        dest: /home/{{ ansible_facts.env.USER }}/custom-vllm:26.07/Dockerfile
+        dest: /home/{{ ansible_facts.env.USER }}/custom-vllm-26.07/Dockerfile
         content: |
           FROM nvcr.io/nvidia/vllm:26.07-py3
 
           RUN pip install -q -U xgrammar && pip install -q transformers==5.6.1
 
-# Place this in your playbook's 'handlers' section
-  handlers:
-    - name: Restart docker service
-      ansible.builtin.systemd_service:
-        name: docker
-        state: restarted
+    - name: Build custom vLLM Docker image
+      community.docker.docker_image:
+        build:
+          path: /home/{{ ansible_facts.env.USER }}/custom-vllm-26.07
+        name: custom-vllm
+        tag: 26.07
+        source: build
+      become: true
+
+    - name: Create Qwen Config file
+      ansible.builtin.copy:
+        dest: /home/{{ ansible_facts.env.USER }}/qwen38_config.yaml
+        content: |
+          # qwen38_config.yaml
+          model: "Qwen/Qwen3.8-27B-FP8"
+          host: "0.0.0.0"
+          port: 8000
+          trust_remote_code: true
+          
+          # Tool and agent settings
+          enable_auto_tool_choice: true
+          tool_call_parser: "qwen3_coder"
+          reasoning_parser: "qwen3"
+          
+          # Efficiency Options for Code
+          enable_prefix_caching: true
+          max_model_len: 131072
+          gpu_memory_utilization: 0.90
+          
+          # Security
+          api_key: "my-super-secret-key-1234"
+
+    - name: Run vLLM Docker container with GPU support
+      community.docker.docker_container:
+        name: vllm-qwen38-nvidia
+        image: custom-vllm:26.07
+        state: started
+        restart_policy: unless-stopped
+        shm_size: "16g"
+        device_requests:
+        - driver: nvidia
+          count: -1
+          capabilities:
+            - ["gpu"]
+        published_ports:
+          - "8000:8000"
+        volumes:
+          - "/home/{{ ansible_facts.env.USER }}/qwen38_config.yaml:/vllm-workspace/qwen38_config.yaml"
+          - "/home/{{ ansible_facts.env.USER }}/.cache/huggingface:/root/.cache/huggingface"
+        command: "vllm serve --config /vllm-workspace/qwen38_config.yaml"
       become: true
