@@ -19,7 +19,7 @@
       "dockerfile": "Dockerfile_Devbox",
       "build_context": ".",
       "memory_mb": 300,
-      "timeout_seconds": 1200
+      "timeout_seconds": 2400
     },
     {
       "name": "gpunode",
@@ -27,7 +27,7 @@
       "dockerfile": "Dockerfile_GpuNode",
       "build_context": ".",
       "memory_mb": 300,
-      "timeout_seconds": 1200
+      "timeout_seconds": 2400
     }
   ]
 }
