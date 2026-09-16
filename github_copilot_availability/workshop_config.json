@@ -1,0 +1,17 @@
+{
+  "users_csv": "../users.csv",
+  "credentials_path": "/Users/jesper/.azure/credentials",
+  "azure_environment": "rubberduck",
+  "memory_reserve_percent": 10,
+  "memory_reserve_min_mb": 512,
+  "containers": [
+    {
+      "name": "gpunode",
+      "image": "github_copilot_gpunode_avail:latest",
+      "dockerfile": "Dockerfile_GpuNode",
+      "build_context": ".",
+      "memory_mb": 300,
+      "timeout_seconds": 2400
+    }
+  ]
+}

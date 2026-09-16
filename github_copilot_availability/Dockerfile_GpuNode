@@ -1,0 +1,21 @@
+FROM python:3.14-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install --no-install-recommends sshpass openssh-client -y \
+	&& apt-get upgrade -y \
+	&& apt-get clean \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir -r /usr/local/lib/python3.14/site-packages/ansible_collections/azure/azcollection/requirements.txt
+
+COPY 02_gpunode_avail.yml ./
+COPY class.azure_rm.yml ./
+
+ARG AZURE_PROFILE=AzureCloud
+ENV AZURE_PROFILE=${AZURE_PROFILE}
+
+CMD ["sh", "-c", "ansible-playbook 02_gpunode_avail.yml -i class.azure_rm.yml -k -e ansible_user=$username -e ansible_password=$password -e gpunode=tag_type_gpunode_$username"]

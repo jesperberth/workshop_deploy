@@ -1,0 +1,19 @@
+---
+- name: Gpunode
+  hosts: "{{ gpunode | default([]) }}"
+  gather_facts: true
+  vars:
+    ansible_host_key_checking: false
+
+  tasks:
+    - name: Check if vLLM server is running on port 8000
+      ansible.builtin.uri:
+        url: "http://10.1.0.6:8000/v1/models"
+        method: GET
+        headers:
+          Authorization: "Bearer my-super-secret-key-1234"
+        status_code: 200
+      register: vllm_check
+      until: vllm_check.status == 200
+      retries: 60
+      delay: 10
