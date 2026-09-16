@@ -1,0 +1,8 @@
+plugin: azure.azcollection.azure_rm
+auth_source: credential_file
+profile: redhat
+include_vm_resource_groups:
+  - "*"
+keyed_groups:
+  - prefix: tag
+    key: tags

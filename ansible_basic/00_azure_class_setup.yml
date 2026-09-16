@@ -1,0 +1,166 @@
+---
+- name: Automation Class
+  hosts: localhost
+  connection: local
+  vars:
+    location: northeurope
+    resource_group: "ansible-{{ adminUser }}"
+    virtualnetwork: automationNetwork
+    subnet: Servers
+
+  tasks:
+    - name: Create resource group
+      azure.azcollection.azure_rm_resourcegroup:
+        name: "{{ resource_group }}"
+        location: "{{ location }}"
+
+    - name: Create a virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ resource_group }}"
+        name: "{{ virtualnetwork }}"
+        address_prefixes_cidr: "10.1.0.0/16"
+
+    - name: Create a subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        virtual_network_name: "{{ virtualnetwork }}"
+        name: "{{ subnet }}"
+        address_prefix_cidr: "10.1.0.0/24"
+
+    - name: Create Security Group for webserver
+      azure.azcollection.azure_rm_securitygroup:
+        resource_group: "{{ resource_group }}"
+        name: SG_Network
+        purge_rules: true
+        rules:
+          - name: Allow_SSH
+            protocol: Tcp
+            destination_port_range: 22
+            access: Allow
+            priority: 100
+            direction: Inbound
+          - name: Allow_RDP
+            protocol: Tcp
+            destination_port_range: 3389
+            access: Allow
+            priority: 101
+            direction: Inbound
+          - name: Allow_HTTP
+            protocol: Tcp
+            destination_port_range: 80
+            access: Allow
+            priority: 102
+            direction: Inbound
+          - name: Allow_HTTPS
+            protocol: Tcp
+            destination_port_range: 443
+            access: Allow
+            priority: 103
+            direction: Inbound
+
+    - name: Create network interfaces
+      azure.azcollection.azure_rm_networkinterface:
+        name: "{{ item.name }}_nic01"
+        resource_group: "{{ resource_group }}"
+        virtual_network: "{{ virtualnetwork }}"
+        subnet_name: "{{ subnet }}"
+        security_group: "SG_Network"
+        enable_ip_forwarding: "{{ item.forward | default(false) }}"
+        ip_configurations:
+          - name: "{{ item.name }}_nic01_ipconfig"
+            public_ip_address_name: "{{ item.name }}_public_ip"
+            primary: true
+            private_ip_allocation_method: Static
+            private_ip_address: "{{ item.ip }}"
+      loop:
+        - {name: 'ovirt', ip: '10.1.0.5'}
+        - {name: 'host1', ip: '10.1.0.15', forward: true}
+        - {name: 'server1', ip: '10.1.0.6'}
+        - {name: 'server2', ip: '10.1.0.7'}
+        - {name: 'server3', ip: '10.1.0.8'}
+        - {name: 'server4', ip: '10.1.0.9'}
+        - {name: 'server5', ip: '10.1.0.10'}
+        - {name: 'student', ip: '10.1.0.4'}
+      async: 1000
+      poll: 0
+      register: create_nic
+
+    - name: Wait for Network Interfaces
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 30
+      delay: 5
+      with_items: "{{ create_nic.results }}"
+
+  # Create Virtual Machines
+    - name: Create Virtual Machines
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ item.name }}"
+        os_type: "{{ item.os }}"
+        admin_username: "{{ adminUser }}"
+        admin_password: "{{ adminPassword }}"
+        managed_disk_type: Premium_LRS
+        state: present
+        image:
+          offer: "{{ item.offer }}"
+          publisher: "{{ item.pub }}"
+          sku: "{{ item.sku }}"
+          version: latest
+        vm_size: "{{ item.size }}"
+        network_interfaces: "{{ item.name }}_nic01"
+        tags:
+          owner: "{{ adminUser }}"
+          ansible: "{{ adminUser }}"
+          type: "{{ item.name  }}_{{ adminUser }}"
+      loop:
+        - {name: 'ovirt', size: 'Standard_D4s_v5', os: 'Linux', offer: 'almalinux-x86_64', pub: 'almalinux', sku: '9-gen2'}
+        - {name: 'host1', size: 'Standard_D4s_v5', os: 'Linux', offer: 'almalinux-x86_64', pub: 'almalinux', sku: '9-gen2'}
+        - {name: 'server1', size: 'Standard_B2s', os: 'Linux', offer: 'RHEL', pub: 'RedHat', sku: '9_4'}
+        - {name: 'server2', size: 'Standard_B2s', os: 'Linux', offer: 'RHEL', pub: 'RedHat', sku: '9_4'}
+        - {name: 'server3', size: 'Standard_B2ms', os: 'Linux', offer: 'ubuntu-24_04-lts', pub: 'canonical', sku: 'server'}
+        - {name: 'server4', size: 'Standard_B4ms', os: 'Linux', offer: 'ubuntu-24_04-lts', pub: 'canonical', sku: 'server'}
+        - {name: 'server5', size: 'Standard_B2ms', os: 'Windows', offer: 'sql2022-ws2022', pub: 'microsoftsqlserver', sku: 'standard-gen2'}
+        - {name: 'student', size: 'Standard_D4s_v5', os: 'Windows', offer: 'windows-11', pub: 'microsoftwindowsdesktop', sku: 'win11-24h2-pro'}
+      async: 1000
+      poll: 0
+      register: create_vm
+
+    - name: Wait for Virtual Machines
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 100
+      delay: 10
+      with_items: "{{ create_vm.results }}"
+
+    - name: Create Datadisk
+      azure.azcollection.azure_rm_manageddisk:
+        name: datadisk
+        location: "{{ location }}"
+        resource_group: "{{ resource_group }}"
+        disk_size_gb: 128
+        storage_account_type: Premium_LRS
+
+    - name: Mount the managed disk to VM
+      azure_rm_manageddisk:
+        name: datadisk
+        resource_group: "{{ resource_group }}"
+        location: "{{ location }}"
+        disk_size_gb: 128
+        managed_by: host1
+        attach_caching: read_only
+
+    - name: Create Azure VM extension to enable sshd on student
+      azure.azcollection.azure_rm_virtualmachineextension:
+        name: student-sshd
+        resource_group: "{{ resource_group }}"
+        virtual_machine_name: student
+        publisher: Microsoft.Compute
+        virtual_machine_extension_type: CustomScriptExtension
+        type_handler_version: "1.10"
+        settings: '{"fileUris": [ "https://raw.githubusercontent.com/jesperberth/automationclass_setup/container-deploy/azure/enable_sshd.ps1" ],"commandToExecute": " powershell -ExecutionPolicy Unrestricted -File enable_sshd.ps1 "}' # noqa yaml[line-length]
+        auto_upgrade_minor_version: true

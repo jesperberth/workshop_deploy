@@ -1,0 +1,25 @@
+{
+  "users_csv": "../users.csv",
+  "credentials_path": "/Users/jesper/.azure/credentials",
+  "azure_environment": "redhat",
+  "memory_reserve_percent": 10,
+  "memory_reserve_min_mb": 512,
+  "containers": [
+    {
+      "name": "azure",
+      "image": "ansible_basic_azure:latest",
+      "dockerfile": "Dockerfile",
+      "build_context": ".",
+      "memory_mb": 2000,
+      "timeout_seconds": 1200
+    },
+    {
+      "name": "student",
+      "image": "ansible_basic_student:latest",
+      "dockerfile": "Dockerfile_Student",
+      "build_context": ".",
+      "memory_mb": 300,
+      "timeout_seconds": 2400
+    }
+  ]
+}
