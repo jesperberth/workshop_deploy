@@ -12,11 +12,33 @@
         upgrade: safe
       become: true
 
+    - name: Wait for the physical A100 GPU to map to the PCI bus
+      ansible.builtin.shell: lspci | grep -i nvidia
+      register: gpu_check
+      retries: 12 
+      delay: 10
+      until: gpu_check.rc == 0
+      changed_when: false
+    
+    - name: Update apt cache and upgrade system packages (including kernel)
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+      register: apt_update_result
+      become: true
+    
+    - name: Reboot if the kernel was updated or if Azure just mapped the PCI device
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: apt_update_result.changed or gpu_check.rc == 0
+      become: true
+
     - name: Install required packages
       ansible.builtin.apt:
         name:
           - btop
-          - nvidia-driver-595-open
+          - nvidia-driver-580
+          - nvidia-utils-580
           - docker.io
           - python3-pip
           - python3-venv
