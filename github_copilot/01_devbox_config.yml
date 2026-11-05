@@ -11,7 +11,7 @@
     ansible_become_password: "{{ ansible_password }}"
     ansible_become_flags: logon_type=new_credentials logon_flags=netcredentials_only
     ubuntuinstalled: false
-    font_zip: 'C:\Users\{{ ansible_user }}\Downloads\ubuntu-font-family-0.83.zip'
+    font_zip: 'C:\Users\{{ ansible_user }}\Downloads\Ubuntu-Sans-Mono-fonts-v1.100.zip'
     font_tmp: 'C:\Windows\Temp\ubuntu-fonts'
     font_names:
       UbuntuMono-R.ttf: Ubuntu Mono (TrueType)
@@ -122,44 +122,47 @@
           - /norestart
       when: not wslpath.stat.exists
 
-    - name: Downlaod UbuntuMono font archive
+    - name: Download modern Ubuntu Sans Mono font archive
       ansible.windows.win_get_url:
-        url: https://assets.ubuntu.com/v1/0cef8205-ubuntu-font-family-0.83.zip
+        url: https://github.com/canonical/Ubuntu-Sans-Mono-fonts/releases/download/v1.100/Ubuntu-Sans-Mono-fonts-v1.100.zip
         dest: '{{ font_zip }}'
         force: false
-
+    
     - name: Extract font archive
       community.windows.win_unzip:
         src: '{{ font_zip }}'
         dest: '{{ font_tmp }}'
         creates: '{{ font_tmp }}'
-
-    - name: Find UbuntuMono font files
-      ansible.windows.win_find:
-        paths: '{{ font_tmp }}'
-        recurse: true
-        patterns: 'UbuntuMono*.ttf'
-      register: mono_fonts
-
-    - name: Copy fonts into the Windows font directory
-      ansible.windows.win_copy:
-        src: '{{ item.path }}'
-        dest: 'C:\Windows\Fonts\{{ item.filename }}'
-        remote_src: true
-      loop: '{{ mono_fonts.files }}'
-      loop_control:
-        label: '{{ item.filename }}'
-
-    - name: Register fonts with Windows
-      ansible.windows.win_regedit:
-        path: HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts
-        name: '{{ font_names[item.filename] }}'
-        data: '{{ item.filename }}'
-        type: string
-      loop: '{{ mono_fonts.files }}'
-      loop_control:
-        label: '{{ item.filename }}'
-
+    
+    - name: Install Ubuntu Sans Mono fonts into Windows Font Store
+      ansible.windows.win_shell: |
+        Add-Type -AssemblyName System.Drawing
+        $fontsPath = "$env:SystemRoot\Fonts"
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+    
+        Get-ChildItem -Path "{{ font_tmp }}" -Recurse -Include "Ubuntu*.ttf" | ForEach-Object {
+            $dest = Join-Path $fontsPath $_.Name
+            if (-not (Test-Path $dest)) {
+                # Copy file directly to the system fonts directory
+                Copy-Item $_.FullName -Destination $dest -Force
+                
+                # Extract accurate font family name via .NET
+                $pfc = New-Object System.Drawing.Text.PrivateFontCollection
+                $pfc.AddFile($_.FullName)
+                if ($pfc.Families.Count -gt 0) {
+                    $fontName = "$($pfc.Families[0].Name) (TrueType)"
+                } else {
+                    $fontName = "$($_.BaseName) (TrueType)"
+                }
+                $pfc.Dispose()
+    
+                # Register the font in the system registry
+                Set-ItemProperty -Path $regPath -Name $fontName -Value $_.Name -Type String
+            }
+        }
+      args:
+        executable: powershell.exe
+    
     - name: Clean up extracted files
       ansible.windows.win_file:
         path: '{{ font_tmp }}'
