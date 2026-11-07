@@ -1,0 +1,311 @@
+---
+- name: Gpunode
+  hosts: "{{ gpunode | default([]) }}"
+  gather_facts: true
+  vars:
+    ansible_host_key_checking: false
+
+  tasks:
+    # FIX: Wait for Azure's background setup to complete before touching apt
+    - name: Wait for cloud-init / apt locks to release cleanly
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Update all packages to their latest version
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
+      become: true
+
+    - name: Wait for the physical A100 GPU to map to the PCI bus
+      ansible.builtin.shell: lspci | grep -i nvidia
+      register: gpu_check
+      retries: 12 
+      delay: 10
+      until: gpu_check.rc == 0
+      changed_when: false
+    
+    - name: Update apt cache and upgrade system packages (including kernel)
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+      register: apt_update_result
+      become: true
+    
+    # FIX: Force a reboot if the system packages updated to ensure kernel alignment
+    - name: Reboot to activate the clean updated kernel base
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: apt_update_result.changed or gpu_check.rc == 0
+      become: true
+
+    # FIX: Added nvidia-dkms-580 to guarantee A100 kernel module compilation
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - btop
+          - nvidia-driver-580
+          - nvidia-dkms-580
+          - nvidia-utils-580
+          - nvidia-modprobe
+          - docker.io
+          - python3-pip
+          - python3-venv
+        state: present
+      become: true
+
+    # FIX: Unconditionally reboot here. The driver compilation MUST be initialized by a fresh boot cycle
+    - name: Reboot to build and bind NVIDIA kernel modules
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      become: true
+
+    - name: Wait for the physical A100 GPU to map to the PCI bus post-reboot
+      ansible.builtin.shell: lspci | grep -i nvidia
+      register: gpu_check
+      retries: 12 
+      delay: 10
+      until: gpu_check.rc == 0
+      changed_when: false
+
+    - name: Add current user to the docker group
+      ansible.builtin.user:
+        name: "{{ ansible_facts.env.USER }}"
+        groups: docker
+        append: true
+      become: true
+
+    - name: Allow current user to run dockerd without a password
+      ansible.builtin.copy:
+        content: "{{ ansible_facts.env.USER }} ALL=(ALL) NOPASSWD: /usr/bin/dockerd\n"
+        dest: /etc/sudoers.d/dockerd-nopasswd
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+      become: true
+
+    - name: Enable and start the Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+      become: true
+
+    - name: Add NVIDIA repository (deb822)
+      ansible.builtin.deb822_repository:
+        name: nvidia-container-toolkit
+        types: deb
+        uris: https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH)
+        suites: /
+        signed_by: https://nvidia.github.io/libnvidia-container/gpgkey
+        state: present
+      become: true
+
+    - name: Install NVIDIA container toolkit
+      ansible.builtin.apt:
+        name: nvidia-container-toolkit
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Configure Docker runtime for NVIDIA Container Toolkit
+      ansible.builtin.command:
+        cmd: nvidia-ctk runtime configure --runtime=docker
+      become: true
+
+    # FIX: Unconditionally restart Docker here to ensure registration of the nvidia runtime
+    - name: Restart Docker service to register new NVIDIA container runtime
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      become: true 
+
+    - name: Ensure MIG mode is disabled on the A100 for global vLLM allocation
+      ansible.builtin.shell: |
+        if nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader | grep -q "Enabled"; then
+          nvidia-smi -mig 0
+          reboot
+        fi
+      async: 10
+      poll: 0
+      become: true
+      register: mig_disable
+
+    - name: Wait for system to come back online if MIG mode change triggered a reboot
+      ansible.builtin.wait_for_connection:
+        delay: 15
+        timeout: 300
+      when: mig_disable.started is defined
+
+    - name: Install Huggingface CLI
+      ansible.builtin.shell:
+        cmd: curl -LsSf https://hf.co/cli/install.sh | bash
+        executable: /bin/bash
+
+    - name: Download Model from Huggingface
+      ansible.builtin.shell:
+        cmd: /home/{{ ansible_facts.env.USER }}/.local/bin/hf download Qwen/Qwen3.8-27B-FP8
+        executable: /bin/bash
+
+    - name: Create directory for Huggingface cache
+      ansible.builtin.file:
+        name: /home/{{ ansible_facts.env.USER }}/custom-vllm-26.07
+        state: directory
+        mode: '0755'
+
+    - name: Create Dockerfile for custom vLLM image
+      ansible.builtin.copy:
+        dest: /home/{{ ansible_facts.env.USER }}/custom-vllm-26.07/Dockerfile
+        content: |
+          FROM nvcr.io/nvidia/vllm:26.07-py3
+          RUN pip install -q -U xgrammar && pip install -q transformers==5.6.1
+
+    - name: Build custom vLLM Docker image
+      community.docker.docker_image:
+        build:
+          path: /home/{{ ansible_facts.env.USER }}/custom-vllm-26.07
+        name: custom-vllm
+        tag: 26.07
+        source: build
+      become: true
+
+    - name: Create Qwen Config file
+      ansible.builtin.copy:
+        dest: /home/{{ ansible_facts.env.USER }}/qwen38_config.yaml
+        content: |
+          # qwen38_config.yaml
+          model: "Qwen/Qwen3.8-27B-FP8"
+          host: "0.0.0.0"
+          port: 8000
+          trust_remote_code: true
+          enable_auto_tool_choice: true
+          tool_call_parser: "qwen3_coder"
+          reasoning_parser: "qwen3"
+          enable_prefix_caching: true
+          max_model_len: 131072
+          gpu_memory_utilization: 0.90
+          api_key: "my-super-secret-key-1234"
+
+    - name: Run vLLM Docker container with GPU support
+      community.docker.docker_container:
+        name: vllm-qwen38-nvidia
+        image: custom-vllm:26.07
+        state: started
+        restart_policy: unless-stopped
+        privileged: true
+        ipc_mode: host
+        shm_size: "16g"
+        device_requests:
+          - driver: nvidia
+            count: -1
+            capabilities:
+              - ["gpu"]
+        published_ports:
+          - "8000:8000"
+        volumes:
+          - "/home/{{ ansible_facts.env.USER }}/qwen38_config.yaml:/vllm-workspace/qwen38_config.yaml"
+          - "/home/{{ ansible_facts.env.USER }}/.cache/huggingface:/root/.cache/huggingface"
+        command: "vllm serve --config /vllm-workspace/qwen38_config.yaml"
+      become: true
+      register: docker_container_result
+      retries: 3
+      delay: 10
+      until: docker_container_result is succeeded
+
+    - name: Create NVIDIA hardware wait systemd script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/wait-for-nvidia-gpu.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          echo "Checking for NVIDIA GPU hardware readiness..."
+          
+          # Ensure kernel modules are explicitly probed on cold boot
+          modprobe nvidia
+          modprobe nvidia_uvns || true
+          modprobe nvidia_uvm
+          
+          for i in {1..30}; do
+            if lspci | grep -i nvidia && nvidia-smi &>/dev/null; then
+              echo "NVIDIA GPU driver responded. Forcing UVM initialization..."
+              sudo nvidia-modprobe -u -c=0
+              
+              # If device node is missing, trigger a manual udevadm trigger to map nodes
+              if [ ! -c /dev/nvidia-uvm ]; then
+                udevadm trigger --action=add /dev/nvidia*
+                sleep 3
+              fi
+              
+              if [ -c /dev/nvidia-uvm ]; then
+                echo "NVIDIA GPU and Unified Memory are fully mapped and operational!"
+                exit 0
+              else
+                echo "GPU found but /dev/nvidia-uvm is missing. Retrying..."
+              fi
+            fi
+            echo "GPU or UVM context not ready yet. Waiting 10 seconds (Attempt $i/30)..."
+            sleep 10
+          done
+          echo "ERROR: NVIDIA GPU failed to initialize within 5 minutes."
+          exit 1
+      become: true
+
+    - name: Create systemd service for NVIDIA hardware wait
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nvidia-hardware-wait.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Wait for NVIDIA GPU Hardware to Map
+          Before=docker.service
+          After=network.target local-fs.target systemd-modules-load.service
+          Wants=systemd-modules-load.service
+          DefaultDependencies=no
+    
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/wait-for-nvidia-gpu.sh
+          RemainAfterExit=yes
+          TimeoutSec=350
+    
+          [Install]
+          WantedBy=multi-user.target
+      become: true
+
+    - name: Inject dependency override into Docker service configuration
+      ansible.builtin.file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Configure Docker to require the NVIDIA hardware check before starting
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker.service.d/override.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          Requires=nvidia-hardware-wait.service
+          After=nvidia-hardware-wait.service
+      become: true
+
+    - name: Reload systemd, enable wait service, and restart Docker
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: nvidia-hardware-wait
+        enabled: true
+        state: started
+      become: true
+
+    - name: Check if vLLM server is running on port 8000
+      ansible.builtin.uri:
+        url: "http://localhost:8000/v1/models" # FIX: Swapped hardcoded IP out for localhost checking consistency
+        method: GET
+        headers:
+          Authorization: "Bearer my-super-secret-key-1234"
+        status_code: 200
+      register: vllm_check
+      until: vllm_check.status == 200
+      retries: 60
+      delay: 10

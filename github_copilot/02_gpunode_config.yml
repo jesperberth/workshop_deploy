@@ -187,53 +187,43 @@
           gpu_memory_utilization: 0.90
           api_key: "my-super-secret-key-1234"
 
-    - name: Run vLLM Docker container with GPU support
-      community.docker.docker_container:
-        name: vllm-qwen38-nvidia
-        image: custom-vllm:26.07
-        state: started
-        restart_policy: unless-stopped
-        privileged: true
-        ipc_mode: host
-        shm_size: "16g"
-        device_requests:
-        - driver: nvidia
-          count: -1
-          capabilities:
-            - ["gpu"]
-        published_ports:
-          - "8000:8000"
-        volumes:
-          - "/home/{{ ansible_facts.env.USER }}/qwen38_config.yaml:/vllm-workspace/qwen38_config.yaml"
-          - "/home/{{ ansible_facts.env.USER }}/.cache/huggingface:/root/.cache/huggingface"
-        command: "vllm serve --config /vllm-workspace/qwen38_config.yaml"
-      become: true
-
-    - name: Create NVIDIA hardware wait systemd script
+    # --- GPU readiness gate: must exist BEFORE docker/vllm are ever started at boot ---
+    - name: Create NVIDIA hardware wait script
       ansible.builtin.copy:
         dest: /usr/local/bin/wait-for-nvidia-gpu.sh
         mode: '0755'
         content: |
           #!/bin/bash
+          # Blocks until the GPU, driver and /dev/nvidia* nodes (incl. uvm) are usable.
           echo "Checking for NVIDIA GPU hardware readiness..."
+
           for i in {1..30}; do
-            if lspci | grep -i nvidia && nvidia-smi; then
-              echo "NVIDIA GPU driver responded. Forcing UVM initialization..."
-              
-              # HARDENING STEPS FOR ERROR 100:
-              sudo nvidia-modprobe -u -c=0
-              
-              echo "Waiting 15 seconds for driver registers to settle..."
-              sleep 15
-              
-              if [ -c /dev/nvidia-uvm ]; then
-                echo "NVIDIA GPU and Unified Memory are fully mapped and operational!"
-                exit 0
-              else
-                echo "GPU found but /dev/nvidia-uvm is missing. Retrying..."
+            modprobe nvidia || true
+            modprobe nvidia_uvm || true
+
+            if lspci | grep -qi nvidia && nvidia-smi -L &>/dev/null; then
+              # Make sure MIG is off (A100 may come back on a new host in a different state)
+              if nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader | grep -q "Enabled"; then
+                echo "MIG enabled, disabling..."
+                nvidia-smi -mig 0 || true
+                nvidia-smi --gpu-reset || true
+                sleep 3
               fi
+
+              # Create device nodes if udev has not done so yet
+              nvidia-modprobe -u -c=0 || true
+              if [ ! -c /dev/nvidia-uvm ]; then
+                udevadm trigger --action=add /dev/nvidia* 2>/dev/null || true
+                sleep 3
+              fi
+
+              if [ -c /dev/nvidia0 ] && [ -c /dev/nvidiactl ] && [ -c /dev/nvidia-uvm ]; then
+                echo "NVIDIA GPU and device nodes are ready."
+                exit 0
+              fi
+              echo "GPU found but device nodes missing. Retrying..."
             fi
-            echo "GPU or UVM context not ready yet. Waiting 10 seconds (Attempt $i/30)..."
+            echo "GPU not ready yet. Waiting 10 seconds (Attempt $i/30)..."
             sleep 10
           done
           echo "ERROR: NVIDIA GPU failed to initialize within 5 minutes."
@@ -248,7 +238,8 @@
           [Unit]
           Description=Wait for NVIDIA GPU Hardware to Map
           Before=docker.service
-          After=local-fs.target systemd-modules-load.service
+          After=local-fs.target systemd-modules-load.service systemd-udev-settle.service
+          Wants=systemd-modules-load.service systemd-udev-settle.service
           DefaultDependencies=no
 
           [Service]
@@ -261,7 +252,7 @@
           WantedBy=multi-user.target
       become: true
 
-    - name: Inject dependency override into Docker service configuration
+    - name: Create Docker drop-in directory
       ansible.builtin.file:
         path: /etc/systemd/system/docker.service.d
         state: directory
@@ -278,17 +269,57 @@
           After=nvidia-hardware-wait.service
       become: true
 
-    - name: Reload systemd, enable wait service, and restart Docker
+    - name: Enable NVIDIA persistence daemon
       ansible.builtin.systemd:
-        daemon_reload: true
-        name: nvidia-hardware-wait
+        name: nvidia-persistenced
         enabled: true
         state: started
+      become: true
+      failed_when: false
+
+    - name: Create vLLM systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vllm.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=vLLM Qwen3.8 server
+          Requires=docker.service nvidia-hardware-wait.service
+          After=docker.service nvidia-hardware-wait.service network-online.target
+          Wants=network-online.target
+
+          [Service]
+          TimeoutStartSec=900
+          Restart=always
+          RestartSec=30
+          # Re-verify the GPU right before every (re)start of the container
+          ExecStartPre=/usr/local/bin/wait-for-nvidia-gpu.sh
+          ExecStartPre=-/usr/bin/docker rm -f vllm-qwen38-nvidia
+          ExecStart=/usr/bin/docker run --rm --name vllm-qwen38-nvidia \
+            --gpus all --ipc=host --shm-size=16g -p 8000:8000 \
+            -v /home/{{ ansible_facts.env.USER }}/qwen38_config.yaml:/vllm-workspace/qwen38_config.yaml \
+            -v /home/{{ ansible_facts.env.USER }}/.cache/huggingface:/root/.cache/huggingface \
+            custom-vllm:26.07 vllm serve --config /vllm-workspace/qwen38_config.yaml
+          ExecStop=/usr/bin/docker stop -t 30 vllm-qwen38-nvidia
+
+          [Install]
+          WantedBy=multi-user.target
+      become: true
+
+    - name: Reload systemd, enable services, and start vLLM
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - nvidia-hardware-wait
+        - vllm
       become: true
 
     - name: Check if vLLM server is running on port 8000
       ansible.builtin.uri:
-        url: "http://localhost:8000/v1/models" # FIX: Swapped hardcoded IP out for localhost checking consistency
+        url: "http://localhost:8000/v1/models"
         method: GET
         headers:
           Authorization: "Bearer my-super-secret-key-1234"
