@@ -138,7 +138,7 @@
           ansible: "{{ adminUser }}"
           type: "{{ item.name  }}_{{ adminUser }}"
       loop:
-        - {name: 'devbox', size: 'Standard_D4ads_v6', os: 'Windows', offer: 'windows-11', pub: 'microsoftwindowsdesktop', sku: 'win11-25h2-pro', security_type: 'TrustedLaunch'}
+        - {name: 'devbox', size: 'Standard_D4as_v7', os: 'Windows', offer: 'windows-11', pub: 'microsoftwindowsdesktop', sku: 'win11-25h2-pro', security_type: 'TrustedLaunch'}
       async: 1000
       poll: 0
       register: create_vm
